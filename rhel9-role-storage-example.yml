@@ -1,0 +1,116 @@
+---
+- name: MAIN  rhce storage handling in RHEL9 style useing redhat.rhel_system_roles.storage
+  # on webservers with existing vgname, 
+  # and minimal lvsize_g_fallback GB available,
+  # allocate lvsize_g GB, if it is availaable
+  # else
+  # allocate lvsize_g_fallback GB
+  # NOTE: MAIN in plays/tasks makes easy 
+  # to filter out role steps with 
+  # :f MAIN inside ansible-navigator
+  hosts: webservers
+  # define default vars
+  vars:
+    vgname: "apache-vg"
+    lvname: "rhce-lv"
+    mountpoint: "/rhce"
+    lvsize_g: 1.5
+    lvsize_g_fallback: 0.8
+  tasks:
+    - name: MAIN  check for {{ vgname }}
+    # skips all if vgname does not exist
+    # use ansible_lvm.vgs from facts to check 
+      fail: 
+        msg: ERROR vg {{ vgname }} does not exist
+      when:
+         - vgname is not in ansible_lvm.vgs
+    - name: MAIN  set vgname_facts
+    # set private facts about vgname for use in other tasks
+    # q/query ansible_lvm.vgs as dict, pick only vgname's facts
+    # I will use only free_g but I got the whole thing
+    # just in case I want later :)
+      ansible.builtin.set_fact:
+        vgname_facts: "{{ item }}"
+      loop: "{{ q('ansible.builtin.dict', ansible_lvm.vgs) }}"
+      when: item.key == vgname
+    - name: MAIN  debug vgname_facts
+    # checking if I got facts ok (optional, just to show how it works)
+      ansible.builtin.debug:
+        var: vgname_facts
+    - name: MAIN  try allocate {{ lvsize_g }} GB or {{ lvsize_g_fallback }} GB
+    # skips if there is not minimal lvsize_g_fallback GB size available
+    # COMPLAINT: could ansible_lvm size attributes be on k instead of g ??? I miss precision.... ;_;
+      block:
+        - name: MAIN  aborting if minimal {{ lvsize_g_fallback }} GB not available
+          fail:
+            msg: ERROR there is not {{ lvsize_g }} GB, free available space is {{ vgname_facts.value.free_g|float }} GB
+          when:
+          # must convert free_g to float  with |float to compare
+          # because size variables are string ones and numeric conditions work better than string ones
+          # safer this way
+            -  vgname_facts.value.free_g|float < lvsize_g_fallback
+        - name: MAIN  setting lvsize_g_actual
+        # conditionally picks lvsize_g or lvsize_g_fallback depending on available space
+          ansible.builtin.set_fact:
+          # same |float thing to check space, 
+          # ternary(true-value, false-value) to choose value based on test
+          # then I had to convert to strings to add required 'g' to pass to storage role
+          # I struggled a little to convert to string, found out there is no |string filter
+          # then I found out |quote to add quotes to number
+          # ???
+          # PROFIT !
+          # then setting a fact for the chosen size
+            lvsize_g_actual: "{{ (vgname_facts.value.free_g|float < lvsize_g) | ternary(lvsize_g_fallback , lvsize_g)|quote + 'g' }}"
+        - name: MAIN  try create lvol withh selected size
+        # now to the real thing, create the lvol/mount point
+        # with storage rhel role
+        # using chosen lvsize
+        # single task for creating lvol/fs/mount
+        # and pv/vg if you need
+        # instead of 3 on community mods 
+        # (though a lot under the role hood - is it worse performance-wise ?)
+        # (though good SAFETY-wise)
+        # another COMPLAINT: does not support disk partitions,
+        # only whole disks
+        # maybe only old grumpy linux folks complain about this ;/
+        # or so role dev thinks
+          ansible.builtin.import_role:
+            name: redhat.rhel_system_roles.storage
+          vars:
+            storage_pools:
+              - name: "{{ vgname }}"
+                type: lvm
+                volumes:
+                  - name: "{{ lvname }}"
+                    size: "{{ lvsize_g_actual }}"
+                    mount_point: "{{ mountpoint }}"
+                    fs_type: xfs
+                    state: present
+      # below stuff is OPTIONAL, just to display results and to remove what was done so you can run many times
+      # you may delete all below if you dont want
+      always:
+        - name: MAIN  results
+          ansible.builtin.shell:
+            cmd: 'df /rhce;mount | grep /rhce'
+          ignore_errors: true
+          register: results
+        - name: MAIN  display results
+          ansible.builtin.debug:
+            var: results
+        - name: MAIN  remove fs and lvol
+          ansible.builtin.import_role:
+            name: redhat.rhel_system_roles.storage
+          vars:
+            storage_pools:
+              - name: "{{ vgname }}"
+                volumes:
+                  - name: "{{ lvname }}"
+                    state: absent
+        - name: MAIN  results after remove
+          ansible.builtin.shell:
+            cmd: 'df /rhce;mount | grep /rhce'
+          ignore_errors: true
+          register: results1
+        - name: MAIN  display results
+          ansible.builtin.debug:
+            var: results1
